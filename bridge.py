@@ -1,6 +1,8 @@
 import asyncio
 import os
 import re
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -11,6 +13,30 @@ from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive and running!")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    port_str = os.getenv("PORT")
+    if not port_str:
+        return
+    try:
+        port = int(port_str)
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        print(f"Health check HTTP server listening on port {port}")
+    except Exception as e:
+        print(f"Failed to start health server: {e}")
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -187,6 +213,7 @@ async def plain_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def main():
+    start_health_server()
     print("Connecting Telethon user session...")
     await telethon_client.connect()
     if not await telethon_client.is_user_authorized():
