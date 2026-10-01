@@ -10,13 +10,14 @@ This project requires you to have legitimate access to the target bot and to fol
 1. Create a Telegram API application at https://my.telegram.org/apps
 2. Put your API ID and API hash in `.env`.
 3. Put your own Telegram bot token in `.env`.
-4. Set `TARGET_BOT=DDxBypass_Bot` (or another bot you are authorized to use).
-5. Generate a Telethon session:
+4. Set `TARGET_CHAT` in `.env` to your target group invite link, group username, or bot username (e.g. `https://t.me/+1EPuo1hBdd02Njlh`).
+5. (Optional) Set `MESSAGE_TEMPLATE={url}` or `MESSAGE_TEMPLATE=/bypass {url}` depending on what format the target expects.
+6. Generate a Telethon session:
    ```bash
    python3 session_generator.py
    ```
    Copy the printed session string into `.env` as `SESSION`.
-6. Start:
+7. Start:
    ```bash
    python3 bridge.py
    ```
@@ -29,6 +30,6 @@ Never publish `.env`, the API hash, bot token, or session string.
 
 ## Architecture
 
-User -> Your Bot -> Telethon user session -> Target bot -> Telethon response -> Your Bot -> User
+User -> Your Bot -> Telethon user session -> Target group/bot -> Telethon response (reply-matched) -> Your Bot -> User
 
-The bridge uses a per-request lock/queue so concurrent requests do not get mixed up.
+The bridge uses a per-request lock and reply-matching so concurrent group chat messages do not get mixed up.

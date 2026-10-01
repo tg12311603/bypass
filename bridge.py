@@ -8,6 +8,9 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import User, Chat, Channel, ChatInviteAlready, ChatInvite
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.errors import UserAlreadyParticipantError
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -42,24 +45,65 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION = os.environ.get("SESSION", "").strip()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-TARGET_BOT = os.getenv("TARGET_BOT", "DDxBypass_Bot").lstrip("@")
-TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+TARGET_CHAT_CONFIG = (
+    os.getenv("TARGET_CHAT")
+    or os.getenv("TARGET_BOT")
+    or "https://t.me/+1EPuo1hBdd02Njlh"
+).strip()
+MESSAGE_TEMPLATE = os.getenv("MESSAGE_TEMPLATE", "{url}").strip()
+TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "45"))
 MAX_URL_LENGTH = int(os.getenv("MAX_URL_LENGTH", "2048"))
+TARGET_ENTITY = None
 
 if not SESSION:
     raise RuntimeError("SESSION is missing. Run session_generator.py first.")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
 
-# A URL-like pattern. We deliberately return the first URL in the target
-# bot's response instead of trying to interpret arbitrary commands.
+# A URL-like pattern.
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 telethon_client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 
-# Serialize requests. This avoids accidentally matching another user's
-# response when the target bot does not provide a request ID/correlation ID.
+# Serialize requests to avoid mixing up multiple concurrent requests
 target_lock = asyncio.Lock()
+
+
+class BypassError(Exception):
+    """Raised when the target bypass service returns an explicit error."""
+    pass
+
+
+def check_for_error(text: str) -> str | None:
+    if not text:
+        return None
+    err_match = re.search(r"(?:▸\s*)?Error\s*[➙:>=→:]\s*([^|\n\r⧖]+)", text, re.IGNORECASE)
+    if err_match:
+        return err_match.group(1).strip()
+
+    error_keywords = [
+        "not supported",
+        "unsupported",
+        "unable to bypass",
+        "invalid url",
+        "failed to bypass",
+        "bypass failed",
+        "could not bypass",
+        "error bypassing",
+        "link expired",
+        "limit reached",
+        "slow down",
+        "flood wait",
+    ]
+    text_lower = text.lower()
+    if any(k in text_lower for k in error_keywords):
+        for line in text.splitlines():
+            line_str = line.strip()
+            if any(k in line_str.lower() for k in error_keywords):
+                return line_str.lstrip("▸•- \t")
+        return text.strip()
+
+    return None
 
 
 def clean_url(url: str) -> str:
@@ -76,69 +120,177 @@ def validate_url(value: str) -> bool:
         return False
 
 
-def extract_bypassed_url(text: str, original_url: str) -> str | None:
-    # 1. Match explicit "Bypassed ➙ <url>" or "Destination / Result" pattern
-    # Handles single hop and multi-hop (↻ x1, ↻ x2) by taking the final bypassed URL
+def is_candidate_url(url: str, original_url: str) -> bool:
+    clean_u = clean_url(url)
+    if not clean_u:
+        return False
+    norm_u = clean_u.rstrip("/")
+    norm_orig = original_url.strip().rstrip("/")
+    if norm_u == norm_orig:
+        return False
+
+    # Exclude internal telegram promos, bots, and group invite links
+    blocked_patterns = [
+        "t.me/dd_bypass",
+        "ddxbypass_bot",
+        "t.me/dd_botz",
+        "1epuo1hbdd02njlh",
+        "t.me/share",
+        "t.me/addstickers",
+        "t.me/joinchat",
+        "t.me/+",
+    ]
+    u_lower = norm_u.lower()
+    for b in blocked_patterns:
+        if b in u_lower:
+            return False
+    return True
+
+
+def extract_bypassed_url(msg_or_text, original_url: str) -> str | None:
+    # 1. If a Telethon Message object was passed, inspect inline buttons first
+    if hasattr(msg_or_text, "buttons") and msg_or_text.buttons:
+        for row in msg_or_text.buttons:
+            for btn in row:
+                btn_url = getattr(btn, "url", None)
+                if btn_url and is_candidate_url(btn_url, original_url):
+                    return clean_url(btn_url)
+
+    # 2. Inspect text entities (hyperlinks / text URLs)
+    if hasattr(msg_or_text, "entities") and msg_or_text.entities:
+        for ent in msg_or_text.entities:
+            ent_url = getattr(ent, "url", None)
+            if ent_url and is_candidate_url(ent_url, original_url):
+                return clean_url(ent_url)
+
+    # 3. Extract plain text
+    text = msg_or_text.raw_text if hasattr(msg_or_text, "raw_text") else str(msg_or_text or "")
+
+    # 4. Match explicit bypass label pattern (e.g. "Bypassed ➙ <url>", "Destination: <url>")
     bypassed_matches = re.findall(
-        r"(?:Bypassed|bypassed|Destination|Result|Unlocked|Final)[^\n\r]*?[➙:>=→]\s*(https?://[^\s<>\"']+)",
+        r"(?:Bypassed|bypassed|Destination|Result|Unlocked|Final|Link)[^\n\r]*?[➙:>=→]\s*(https?://[^\s<>\"']+)",
         text,
         re.IGNORECASE,
     )
-    if bypassed_matches:
-        return clean_url(bypassed_matches[-1])
+    for match in reversed(bypassed_matches):
+        if is_candidate_url(match, original_url):
+            return clean_url(match)
 
-    # 2. Fallback: Find all URLs in response and exclude the original URL and promo/bot links
+    # 5. Fallback: Find all URLs in message text
     all_urls = [clean_url(x) for x in URL_RE.findall(text)]
-    norm_orig = original_url.strip().rstrip("/")
-    candidate_urls = [
-        u
-        for u in all_urls
-        if u.rstrip("/") != norm_orig
-        and "t.me/DD_Bypass" not in u
-        and "DDxBypass_Bot" not in u
-    ]
+    candidate_urls = [u for u in all_urls if is_candidate_url(u, original_url)]
     if candidate_urls:
         return candidate_urls[-1]
 
     return None
 
 
+async def resolve_target(client: TelegramClient, target_str: str):
+    target_str = target_str.strip()
+    invite_match = re.search(
+        r"(?:t\.me/\+|t\.me/joinchat/|tg://join\?invite=|\+)([a-zA-Z0-9_-]+)",
+        target_str,
+    )
+    if invite_match:
+        invite_hash = invite_match.group(1)
+        try:
+            check = await client(CheckChatInviteRequest(invite_hash))
+            if isinstance(check, ChatInviteAlready):
+                chat_title = getattr(check.chat, "title", str(check.chat.id))
+                print(f"Target is group (already joined): {chat_title}")
+                return await client.get_entity(check.chat)
+            elif isinstance(check, ChatInvite):
+                print(f"Target is group '{getattr(check, 'title', invite_hash)}', joining via invite...")
+                updates = await client(ImportChatInviteRequest(invite_hash))
+                if updates.chats:
+                    return await client.get_entity(updates.chats[0])
+        except UserAlreadyParticipantError:
+            print("Already a participant in target group.")
+        except Exception as e:
+            print(f"Notice during group invite resolution: {e}")
+
+    # Numeric chat ID
+    if target_str.lstrip("-").isdigit():
+        return await client.get_entity(int(target_str))
+
+    # Username or link without '+'
+    username = (
+        target_str.replace("https://t.me/", "")
+        .replace("http://t.me/", "")
+        .lstrip("@")
+        .rstrip("/")
+    )
+    try:
+        return await client.get_entity(username)
+    except Exception as exc:
+        async for dialog in client.iter_dialogs():
+            d_uname = getattr(dialog.entity, "username", None) or ""
+            d_title = getattr(dialog.entity, "title", None) or ""
+            if username.lower() in [d_uname.lower(), d_title.lower()]:
+                return dialog.entity
+        raise exc
+
+
 async def bypass_url(url: str) -> str:
+    global TARGET_ENTITY
     async with target_lock:
-        target = await telethon_client.get_entity(TARGET_BOT)
+        if TARGET_ENTITY is None:
+            TARGET_ENTITY = await resolve_target(telethon_client, TARGET_CHAT_CONFIG)
+        target = TARGET_ENTITY
 
-        # Mark the current end of the conversation so we only inspect
-        # messages arriving after our request.
-        before_id = 0
-        recent = await telethon_client.get_messages(target, limit=1)
-        if recent:
-            before_id = recent[0].id
+        is_private = isinstance(target, User)
 
-        await telethon_client.send_message(target, url)
+        msg_text = (
+            MESSAGE_TEMPLATE.format(url=url)
+            if "{url}" in MESSAGE_TEMPLATE
+            else f"{MESSAGE_TEMPLATE} {url}"
+        )
+
+        sent_msg = await telethon_client.send_message(target, msg_text)
+        sent_id = sent_msg.id
+        bot_reply_id = None
 
         deadline = asyncio.get_running_loop().time() + TIMEOUT
 
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                raise TimeoutError("Target bot did not reply in time.")
+                raise TimeoutError("Target did not reply in time.")
 
-            messages = await telethon_client.get_messages(target, limit=10)
-            # get_messages returns newest first.
-            for msg in reversed(messages):
-                if msg.id <= before_id:
-                    continue
+            messages = await telethon_client.get_messages(target, limit=35)
+            # Inspect messages from newest to oldest
+            for msg in messages:
+                if is_private:
+                    # In a 1-on-1 private chat, messages with id > sent_id are from target
+                    if msg.id <= sent_id:
+                        continue
+                else:
+                    # In a group chat, match replies to our message or replies to the bot's initial response
+                    reply_id = getattr(msg, "reply_to_msg_id", None)
+                    if reply_id is None and getattr(msg, "reply_to", None):
+                        reply_id = getattr(msg.reply_to, "reply_to_msg_id", None)
+
+                    is_match = (
+                        (reply_id == sent_id)
+                        or (bot_reply_id and reply_id == bot_reply_id)
+                    )
+
+                    if not is_match:
+                        continue
+
+                # Record the bot reply message ID
+                bot_reply_id = msg.id
                 text = msg.raw_text or ""
-                if not text:
-                    continue
 
-                bypassed = extract_bypassed_url(text, url)
+                # 1. Check for explicit error messages from the bot (e.g. "Link not supported !")
+                err_desc = check_for_error(text)
+                if err_desc:
+                    raise BypassError(err_desc)
+
+                # 2. Extract bypassed destination URL
+                bypassed = extract_bypassed_url(msg, url)
                 if bypassed:
                     return bypassed
-
-                # If the target bot sent an explicit failure or unsupported message
-                if any(keyword in text.lower() for keyword in ["unable to bypass", "invalid url", "unsupported", "failed"]):
-                    return text.strip()
 
             await asyncio.sleep(0.75)
 
@@ -176,9 +328,11 @@ async def bypass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await bypass_url(url)
         await status.edit_text(f"✅ Result:\n{result}")
+    except BypassError as err:
+        await status.edit_text(f"❌ Error: {err}")
     except TimeoutError:
         await status.edit_text(
-            "⌛ The target bot did not reply within the timeout. Try again later."
+            "⌛ The target did not reply within the timeout. Try again later."
         )
     except Exception as exc:
         print("Bridge error:", repr(exc))
@@ -205,8 +359,10 @@ async def plain_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await bypass_url(url)
         await status.edit_text(f"✅ Result:\n{result}")
+    except BypassError as err:
+        await status.edit_text(f"❌ Error: {err}")
     except TimeoutError:
-        await status.edit_text("⌛ Target bot timed out. Please try again.")
+        await status.edit_text("⌛ Target timed out. Please try again.")
     except Exception as exc:
         print("Bridge error:", repr(exc))
         await status.edit_text("❌ Processing failed. Check the terminal logs.")
@@ -221,8 +377,14 @@ async def main():
     me = await telethon_client.get_me()
     print(f"Telethon logged in as @{me.username or me.id}")
 
-    target = await telethon_client.get_entity(TARGET_BOT)
-    print(f"Target bot: @{getattr(target, 'username', TARGET_BOT)}")
+    global TARGET_ENTITY
+    TARGET_ENTITY = await resolve_target(telethon_client, TARGET_CHAT_CONFIG)
+    target_name = (
+        getattr(TARGET_ENTITY, "title", None)
+        or getattr(TARGET_ENTITY, "username", None)
+        or str(getattr(TARGET_ENTITY, "id", TARGET_CHAT_CONFIG))
+    )
+    print(f"Target resolved: {target_name}")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
