@@ -45,6 +45,8 @@ SESSION = os.environ.get("SESSION", "").strip()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 TARGET_BOT = os.getenv("TARGET_BOT", "DDxBypass_Bot").lstrip("@")
 TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+CAPTCHA_TIMEOUT = int(os.getenv("CAPTCHA_TIMEOUT", "120"))
+CAPTCHA_RETRY_INTERVAL = int(os.getenv("CAPTCHA_RETRY_INTERVAL", "12"))
 MAX_URL_LENGTH = int(os.getenv("MAX_URL_LENGTH", "2048"))
 
 if not SESSION:
@@ -63,6 +65,61 @@ telethon_client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 target_lock = asyncio.Lock()
 
 
+class BypassError(Exception):
+    """Raised when the target bypass bot returns an explicit error."""
+    pass
+
+
+def is_captcha_challenge(text: str) -> bool:
+    if not text:
+        return False
+    keywords = [
+        "captcha",
+        "solve the",
+        "verify",
+        "verification",
+        "recaptcha",
+        "turnstile",
+        "human verification",
+        "please verify",
+    ]
+    text_lower = text.lower()
+    return any(k in text_lower for k in keywords)
+
+
+def check_for_error(text: str) -> str | None:
+    if not text or is_captcha_challenge(text):
+        return None
+
+    # Check for explicit error label like "Error : ...", "❌ Error: ..."
+    err_match = re.search(r"(?:▸\s*|❌\s*)?Error\s*[:➙>=→]\s*([^\n\r]+)", text, re.IGNORECASE)
+    if err_match:
+        return err_match.group(1).strip().lstrip("❌: ")
+
+    error_keywords = [
+        "not supported",
+        "unsupported",
+        "unable to bypass",
+        "invalid url",
+        "invalid link",
+        "failed to bypass",
+        "bypass failed",
+        "could not bypass",
+        "error bypassing",
+        "link expired",
+        "limit reached",
+        "slow down",
+        "flood wait",
+    ]
+    text_lower = text.lower()
+    for line in text.splitlines():
+        line_str = line.strip()
+        if any(k in line_str.lower() for k in error_keywords):
+            return line_str.lstrip("▸•-❌ \t")
+
+    return None
+
+
 def clean_url(url: str) -> str:
     return url.rstrip(".,;:!?)]}>")
 
@@ -78,26 +135,28 @@ def validate_url(value: str) -> bool:
 
 
 def extract_bypassed_url(text: str, original_url: str) -> str | None:
-    # 1. Match explicit "Bypassed ➙ <url>" or "Destination / Result" pattern
-    # Handles single hop and multi-hop (↻ x1, ↻ x2) by taking the final bypassed URL
+    norm_orig = original_url.strip().rstrip("/")
+    bot_lower = TARGET_BOT.lower().lstrip("@")
+
+    # 1. Match explicit "Bypassed Link :✅ <url>", "Bypassed ➙ <url>", "Destination: <url>", etc.
     bypassed_matches = re.findall(
-        r"(?:Bypassed|bypassed|Destination|Result|Unlocked|Final)[^\n\r]*?[➙:>=→]\s*(https?://[^\s<>\"']+)",
+        r"(?:Bypassed(?:\s*Link)?|Destination|Result|Unlocked|Final)[^\n\r]*?(https?://[^\s<>\"']+)",
         text,
         re.IGNORECASE,
     )
-    if bypassed_matches:
-        return clean_url(bypassed_matches[-1])
+    for match in reversed(bypassed_matches):
+        cleaned = clean_url(match)
+        if cleaned.rstrip("/") != norm_orig and f"t.me/{bot_lower}" not in cleaned.lower():
+            return cleaned
 
-    # 2. Fallback: Find all URLs in response and exclude the original URL and promo/bot links
+    # 2. Fallback: Find all URLs in response and exclude the original URL and target bot links
     all_urls = [clean_url(x) for x in URL_RE.findall(text)]
-    norm_orig = original_url.strip().rstrip("/")
-    bot_lower = TARGET_BOT.lower()
     candidate_urls = [
         u
         for u in all_urls
         if u.rstrip("/") != norm_orig
-        and bot_lower not in u.lower()
-        and "t.me/" not in u.lower().replace(f"t.me/{bot_lower}", "")
+        and f"t.me/{bot_lower}" not in u.lower()
+        and f"@{bot_lower}" not in u.lower()
     ]
     if candidate_urls:
         return candidate_urls[-1]
@@ -105,7 +164,7 @@ def extract_bypassed_url(text: str, original_url: str) -> str | None:
     return None
 
 
-async def bypass_url(url: str) -> str:
+async def bypass_url(url: str, on_status_update=None) -> str:
     async with target_lock:
         target = await telethon_client.get_entity(TARGET_BOT)
 
@@ -118,31 +177,56 @@ async def bypass_url(url: str) -> str:
 
         await telethon_client.send_message(target, url)
 
-        deadline = asyncio.get_running_loop().time() + TIMEOUT
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + TIMEOUT
+        last_resend_time = loop.time()
+        captcha_active = False
 
         while True:
-            remaining = deadline - asyncio.get_running_loop().time()
+            now = loop.time()
+            remaining = deadline - now
             if remaining <= 0:
+                if captcha_active:
+                    raise TimeoutError(
+                        "Processing timed out. Please try sending the link again."
+                    )
                 raise TimeoutError("Target bot did not reply in time.")
 
-            messages = await telethon_client.get_messages(target, limit=10)
-            # get_messages returns newest first.
-            for msg in reversed(messages):
+            messages = await telethon_client.get_messages(target, limit=15)
+            # Inspect messages from newest to oldest
+            for msg in messages:
                 if msg.id <= before_id:
                     continue
                 text = msg.raw_text or ""
                 if not text:
                     continue
 
+                # 1. Try to extract bypassed destination URL
                 bypassed = extract_bypassed_url(text, url)
                 if bypassed:
                     return bypassed
 
-                # If the target bot sent an explicit failure or unsupported message
-                if any(keyword in text.lower() for keyword in ["unable to bypass", "invalid url", "unsupported", "failed"]):
-                    return text.strip()
+                # 2. Detect Captcha challenge
+                if is_captcha_challenge(text):
+                    if not captcha_active:
+                        captcha_active = True
+                        deadline = max(deadline, now + CAPTCHA_TIMEOUT)
+                        if on_status_update:
+                            await on_status_update(
+                                "⏳ Please wait, processing..."
+                            )
 
-            await asyncio.sleep(0.75)
+                # 3. Check for explicit error messages from the bot (only if not a captcha prompt)
+                err = check_for_error(text)
+                if err:
+                    raise BypassError(err)
+
+            # If captcha is active, periodically resend the link to the target bot
+            if captcha_active and (now - last_resend_time >= CAPTCHA_RETRY_INTERVAL):
+                await telethon_client.send_message(target, url)
+                last_resend_time = now
+
+            await asyncio.sleep(1.0)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -175,13 +259,19 @@ async def bypass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(ChatAction.TYPING)
     status = await update.message.reply_text("⏳ Processing...")
 
+    async def update_status(msg: str):
+        try:
+            await status.edit_text(msg)
+        except Exception:
+            pass
+
     try:
-        result = await bypass_url(url)
+        result = await bypass_url(url, on_status_update=update_status)
         await status.edit_text(f"✅ Result:\n{result}")
-    except TimeoutError:
-        await status.edit_text(
-            "⌛ The target bot did not reply within the timeout. Try again later."
-        )
+    except BypassError as err:
+        await status.edit_text(f"❌ Error: {err}")
+    except TimeoutError as err:
+        await status.edit_text(f"⌛ {err}")
     except Exception as exc:
         print("Bridge error:", repr(exc))
         await status.edit_text(
@@ -204,11 +294,19 @@ async def plain_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(ChatAction.TYPING)
     status = await update.message.reply_text("⏳ Processing...")
 
+    async def update_status(msg: str):
+        try:
+            await status.edit_text(msg)
+        except Exception:
+            pass
+
     try:
-        result = await bypass_url(url)
+        result = await bypass_url(url, on_status_update=update_status)
         await status.edit_text(f"✅ Result:\n{result}")
-    except TimeoutError:
-        await status.edit_text("⌛ Target bot timed out. Please try again.")
+    except BypassError as err:
+        await status.edit_text(f"❌ Error: {err}")
+    except TimeoutError as err:
+        await status.edit_text(f"⌛ {err}")
     except Exception as exc:
         print("Bridge error:", repr(exc))
         await status.edit_text("❌ Processing failed. Check the terminal logs.")
