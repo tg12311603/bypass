@@ -91,12 +91,13 @@ def extract_bypassed_url(text: str, original_url: str) -> str | None:
     # 2. Fallback: Find all URLs in response and exclude the original URL and promo/bot links
     all_urls = [clean_url(x) for x in URL_RE.findall(text)]
     norm_orig = original_url.strip().rstrip("/")
+    bot_lower = TARGET_BOT.lower()
     candidate_urls = [
         u
         for u in all_urls
         if u.rstrip("/") != norm_orig
-        and "t.me/DD_Bypass" not in u
-        and "DDxBypass_Bot" not in u
+        and bot_lower not in u.lower()
+        and "t.me/" not in u.lower().replace(f"t.me/{bot_lower}", "")
     ]
     if candidate_urls:
         return candidate_urls[-1]
