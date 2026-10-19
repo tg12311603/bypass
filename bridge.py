@@ -44,9 +44,10 @@ API_HASH = os.environ["API_HASH"]
 SESSION = os.environ.get("SESSION", "").strip()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 TARGET_BOT = os.getenv("TARGET_BOT", "DDxBypass_Bot").lstrip("@")
-TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "45"))
 CAPTCHA_TIMEOUT = int(os.getenv("CAPTCHA_TIMEOUT", "120"))
-CAPTCHA_RETRY_INTERVAL = int(os.getenv("CAPTCHA_RETRY_INTERVAL", "12"))
+RETRY_INTERVAL = 20
+CAPTCHA_RETRY_INTERVAL = 20
 MAX_URL_LENGTH = int(os.getenv("MAX_URL_LENGTH", "2048"))
 
 if not SESSION:
@@ -91,15 +92,19 @@ def check_for_error(text: str) -> str | None:
     if not text or is_captcha_challenge(text):
         return None
 
-    # Check for explicit error label like "Error : ...", "❌ Error: ..."
-    err_match = re.search(r"(?:▸\s*|❌\s*)?Error\s*[:➙>=→]\s*([^\n\r]+)", text, re.IGNORECASE)
+    # Check for explicit error label like "Error : ...", "❌ Error: ...", "⚠️ Warning: ..."
+    err_match = re.search(r"(?:▸\s*|[❌⚠️]\s*)?(?:Error|Warning)\s*[:➙>=→]\s*([^\n\r]+)", text, re.IGNORECASE)
     if err_match:
-        return err_match.group(1).strip().lstrip("❌: ")
+        return err_match.group(1).strip().lstrip("❌⚠️: ")
 
     error_keywords = [
+        "no script found",
+        "script not found",
+        "no bypass found",
         "not supported",
         "unsupported",
         "unable to bypass",
+        "cannot bypass",
         "invalid url",
         "invalid link",
         "failed to bypass",
@@ -111,11 +116,16 @@ def check_for_error(text: str) -> str | None:
         "slow down",
         "flood wait",
     ]
-    text_lower = text.lower()
-    for line in text.splitlines():
-        line_str = line.strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for i, line_str in enumerate(lines):
         if any(k in line_str.lower() for k in error_keywords):
-            return line_str.lstrip("▸•-❌ \t")
+            clean_err = line_str.lstrip("▸•-❌⚠️ \t")
+            # If the error line ends with ':' and the next line has details (e.g. the url), include it
+            if clean_err.endswith(":") and i + 1 < len(lines):
+                next_line = lines[i + 1]
+                if not next_line.lower().startswith("powered by") and not next_line.startswith("|"):
+                    return f"{clean_err} {next_line}"
+            return clean_err
 
     return None
 
@@ -186,11 +196,7 @@ async def bypass_url(url: str, on_status_update=None) -> str:
             now = loop.time()
             remaining = deadline - now
             if remaining <= 0:
-                if captcha_active:
-                    raise TimeoutError(
-                        "Processing timed out. Please try sending the link again."
-                    )
-                raise TimeoutError("Target bot did not reply in time.")
+                raise TimeoutError("We are unable to bypass link, try again later.")
 
             messages = await telethon_client.get_messages(target, limit=15)
             # Inspect messages from newest to oldest
@@ -206,7 +212,12 @@ async def bypass_url(url: str, on_status_update=None) -> str:
                 if bypassed:
                     return bypassed
 
-                # 2. Detect Captcha challenge
+                # 2. Check for explicit error messages from the bot first (e.g. "No Script Found")
+                err = check_for_error(text)
+                if err:
+                    raise BypassError(err)
+
+                # 3. Detect Captcha challenge
                 if is_captcha_challenge(text):
                     if not captcha_active:
                         captcha_active = True
@@ -216,13 +227,16 @@ async def bypass_url(url: str, on_status_update=None) -> str:
                                 "⏳ Please wait, processing..."
                             )
 
-                # 3. Check for explicit error messages from the bot (only if not a captcha prompt)
-                err = check_for_error(text)
-                if err:
-                    raise BypassError(err)
+            # Check if any incoming message from target has arrived after before_id
+            bot_replied = any(
+                msg.id > before_id and not getattr(msg, "out", False)
+                for msg in messages
+            )
 
-            # If captcha is active, periodically resend the link to the target bot
-            if captcha_active and (now - last_resend_time >= CAPTCHA_RETRY_INTERVAL):
+            # Resend every 20 seconds:
+            # - While waiting on captcha resolution
+            # - Or if the bot hasn't replied at all
+            if (captcha_active or not bot_replied) and (now - last_resend_time >= RETRY_INTERVAL):
                 await telethon_client.send_message(target, url)
                 last_resend_time = now
 
