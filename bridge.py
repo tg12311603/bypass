@@ -87,9 +87,6 @@ FORCE_SUB_CHANNEL_URL = os.getenv(
     else "https://t.me/agents_Verse",
 ).strip()
 
-VERIFIED_USERS_CACHE: dict[int, float] = {}
-CACHE_TTL = 300  # Cache membership verification for 5 minutes
-
 FORCE_SUB_MESSAGE = (
     "⚠️ You must join our channel to use this bot!\n\n"
     "Please click 'Join Channel' below, join the channel, and then click 'Verify'."
@@ -118,13 +115,9 @@ def get_force_sub_keyboard() -> InlineKeyboardMarkup:
 
 
 async def check_user_membership(
-    user_id: int, context: ContextTypes.DEFAULT_TYPE, bypass_cache: bool = False
+    user_id: int, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
     if not FORCE_SUB_CHANNEL:
-        return True
-
-    now = asyncio.get_running_loop().time()
-    if not bypass_cache and (now - VERIFIED_USERS_CACHE.get(user_id, 0)) < CACHE_TTL:
         return True
 
     try:
@@ -136,20 +129,16 @@ async def check_user_membership(
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.MEMBER,
         }:
-            VERIFIED_USERS_CACHE[user_id] = now
             return True
         if member.status == ChatMemberStatus.RESTRICTED and getattr(
             member, "is_member", False
         ):
-            VERIFIED_USERS_CACHE[user_id] = now
             return True
 
-        VERIFIED_USERS_CACHE.pop(user_id, None)
         return False
     except BadRequest as e:
         err_msg = str(e).lower()
         if any(term in err_msg for term in ["participant", "user not found"]):
-            VERIFIED_USERS_CACHE.pop(user_id, None)
             return False
         if "chat admin required" in err_msg or "not enough rights" in err_msg:
             print(
@@ -157,7 +146,6 @@ async def check_user_membership(
             )
             return False
         print(f"Error checking channel membership for user {user_id}: {e}")
-        VERIFIED_USERS_CACHE.pop(user_id, None)
         return False
     except Exception as e:
         print(f"Unexpected error checking channel membership for user {user_id}: {e}")
@@ -170,7 +158,7 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    is_member = await check_user_membership(user_id, context, bypass_cache=True)
+    is_member = await check_user_membership(user_id, context)
 
     if is_member:
         await query.answer("✅ Verified! Welcome aboard.", show_alert=False)
