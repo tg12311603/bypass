@@ -9,9 +9,17 @@ from urllib.request import urlopen
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction, ChatMemberStatus, KeyboardButtonStyle
+from telegram.error import BadRequest, TelegramError
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 load_dotenv()
 
@@ -49,6 +57,137 @@ CAPTCHA_TIMEOUT = int(os.getenv("CAPTCHA_TIMEOUT", "120"))
 RETRY_INTERVAL = 20
 CAPTCHA_RETRY_INTERVAL = 20
 MAX_URL_LENGTH = int(os.getenv("MAX_URL_LENGTH", "2048"))
+
+
+def format_channel_id(channel: str):
+    channel = channel.strip()
+    if not channel:
+        return ""
+    if "t.me/" in channel:
+        channel = channel.split("t.me/")[-1].split("/")[0].split("?")[0]
+    if channel.startswith("-100") and channel[1:].isdigit():
+        return int(channel)
+    if channel.lstrip("-").isdigit():
+        return int(channel)
+    if not channel.startswith("@"):
+        channel = f"@{channel}"
+    return channel
+
+
+FORCE_SUB_CHANNEL_RAW = os.getenv("FORCE_SUB_CHANNEL", "@agents_Verse").strip()
+FORCE_SUB_CHANNEL = (
+    None
+    if FORCE_SUB_CHANNEL_RAW.lower() in ("", "false", "none", "off", "0")
+    else format_channel_id(FORCE_SUB_CHANNEL_RAW)
+)
+FORCE_SUB_CHANNEL_URL = os.getenv(
+    "FORCE_SUB_CHANNEL_URL",
+    f"https://t.me/{str(FORCE_SUB_CHANNEL).lstrip('@')}"
+    if str(FORCE_SUB_CHANNEL).startswith("@")
+    else "https://t.me/agents_Verse",
+).strip()
+
+VERIFIED_USERS_CACHE: dict[int, float] = {}
+CACHE_TTL = 300  # Cache membership verification for 5 minutes
+
+FORCE_SUB_MESSAGE = (
+    "⚠️ You must join our channel to use this bot!\n\n"
+    "Please click 'Join Channel' below, join the channel, and then click 'Verify'."
+)
+
+
+def get_force_sub_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📢 Join Channel",
+                    url=FORCE_SUB_CHANNEL_URL,
+                    style=KeyboardButtonStyle.PRIMARY,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✅ Verify",
+                    callback_data="verify_channel",
+                    style=KeyboardButtonStyle.SUCCESS,
+                )
+            ],
+        ]
+    )
+
+
+async def check_user_membership(
+    user_id: int, context: ContextTypes.DEFAULT_TYPE, bypass_cache: bool = False
+) -> bool:
+    if not FORCE_SUB_CHANNEL:
+        return True
+
+    now = asyncio.get_running_loop().time()
+    if not bypass_cache and (now - VERIFIED_USERS_CACHE.get(user_id, 0)) < CACHE_TTL:
+        return True
+
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=FORCE_SUB_CHANNEL, user_id=user_id
+        )
+        if member.status in {
+            ChatMemberStatus.OWNER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.MEMBER,
+        }:
+            VERIFIED_USERS_CACHE[user_id] = now
+            return True
+        if member.status == ChatMemberStatus.RESTRICTED and getattr(
+            member, "is_member", False
+        ):
+            VERIFIED_USERS_CACHE[user_id] = now
+            return True
+
+        VERIFIED_USERS_CACHE.pop(user_id, None)
+        return False
+    except BadRequest as e:
+        err_msg = str(e).lower()
+        if any(term in err_msg for term in ["participant", "user not found"]):
+            VERIFIED_USERS_CACHE.pop(user_id, None)
+            return False
+        if "chat admin required" in err_msg or "not enough rights" in err_msg:
+            print(
+                f"[WARNING] Bot must be an administrator in {FORCE_SUB_CHANNEL} to check user membership!"
+            )
+            return False
+        print(f"Error checking channel membership for user {user_id}: {e}")
+        VERIFIED_USERS_CACHE.pop(user_id, None)
+        return False
+    except Exception as e:
+        print(f"Unexpected error checking channel membership for user {user_id}: {e}")
+        return False
+
+
+async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+
+    user_id = update.effective_user.id
+    is_member = await check_user_membership(user_id, context, bypass_cache=True)
+
+    if is_member:
+        await query.answer("✅ Verified! Welcome aboard.", show_alert=False)
+        try:
+            await query.edit_message_text(
+                "✅ Verification successful!\n\n"
+                "👋 Send me a short URL and I'll try to process it.\n\n"
+                "Example:\nhttps://example.com/short-link"
+            )
+        except Exception as e:
+            print(f"Failed to edit message after verification: {e}")
+    else:
+        await query.answer(
+            "❌ You have not joined the channel yet!\n\n"
+            "Please join the channel and click Verify again.",
+            show_alert=True,
+        )
 
 if not SESSION:
     raise RuntimeError("SESSION is missing. Run session_generator.py first.")
@@ -244,6 +383,17 @@ async def bypass_url(url: str, on_status_update=None) -> str:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+
+    is_member = await check_user_membership(update.effective_user.id, context)
+    if not is_member:
+        await update.message.reply_text(
+            "👋 Welcome!\n\n" + FORCE_SUB_MESSAGE,
+            reply_markup=get_force_sub_keyboard(),
+        )
+        return
+
     await update.message.reply_text(
         "👋 Send me a short URL and I'll try to process it.\n\n"
         "Example:\nhttps://example.com/short-link"
@@ -251,7 +401,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def bypass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+    if not update.message or not update.effective_user:
+        return
+
+    is_member = await check_user_membership(update.effective_user.id, context)
+    if not is_member:
+        await update.message.reply_text(
+            FORCE_SUB_MESSAGE,
+            reply_markup=get_force_sub_keyboard(),
+        )
         return
 
     text = (update.message.text or "").strip()
@@ -294,7 +452,15 @@ async def bypass(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def plain_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+    if not update.message or not update.effective_user:
+        return
+
+    is_member = await check_user_membership(update.effective_user.id, context)
+    if not is_member:
+        await update.message.reply_text(
+            FORCE_SUB_MESSAGE,
+            reply_markup=get_force_sub_keyboard(),
+        )
         return
 
     url = (update.message.text or "").strip()
@@ -364,6 +530,7 @@ async def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("bypass", bypass))
+    app.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify_channel$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_url))
 
     print("Bot is running. Press Ctrl+C to stop.")
